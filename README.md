@@ -1,10 +1,11 @@
 # Dynamic Region-Level Coherence for Multi-Agent Radix Prefix Trees
 
-For the newer **policy-neutral execution-time sensitivity model**, see
+For the newer **finite-cache execution-time sensitivity model**, see
 [perf/README.md](perf/README.md). Build it independently with
 `cmake -S perf -B build-perf`; run `build-perf/architecture_perf`. It uses no
-coherence policy and reports how assumed overhead reductions affect elapsed
-simulated execution time. See [PERFORMANCE_RESULTS.md](PERFORMANCE_RESULTS.md)
+optimized coherence policy. It profiles baseline directory traffic with finite
+caches, then times hypothetical event-cost reductions with fork costs and
+bounded compute/memory overlap. See [PERFORMANCE_RESULTS.md](PERFORMANCE_RESULTS.md)
 for the validated sensitivity results. The remainder of this README describes the original
 state-machine experiment.
 

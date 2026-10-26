@@ -124,6 +124,27 @@ void RegionStateMachine::local_hit() {
     metrics_.data_cycles += config_.costs.local_hit;
 }
 
+bool RegionStateMachine::evict(NodeId node, RegionId id, std::size_t offset) {
+    auto& region = regions_.at(id);
+    if (region.mode != Mode::Coherent) throw std::logic_error("capacity profiler requires coherent mode");
+    auto& line = region.lines.at(offset);
+    auto& copy = line.copies.at(static_cast<std::size_t>(node));
+    if (!copy.valid) return false;
+    const bool dirty = copy.dirty;
+    if (dirty) flush(line, false);
+    copy = CacheCopy{};
+    if (line.exclusive_owner == node) line.exclusive_owner = no_owner;
+    if (config_.check_invariants) check_region(id);
+    return dirty;
+}
+
+void RegionStateMachine::writeback_region(RegionId id) {
+    auto& region = regions_.at(id);
+    if (region.mode != Mode::Coherent) throw std::logic_error("profiling fence requires coherent mode");
+    for (auto& line : region.lines) flush(line, false);
+    if (config_.check_invariants) check_region(id);
+}
+
 void RegionStateMachine::fill(Line& line, NodeId node) {
     auto& copy = line.copies.at(static_cast<std::size_t>(node));
     copy = {true, false, line.memory_version};

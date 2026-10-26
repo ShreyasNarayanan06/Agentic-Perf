@@ -1,158 +1,223 @@
-# Policy-neutral performance simulator
+# Finite-cache performance sensitivity model (v2)
 
-This independent C++17 discrete-event model asks: **how much execution-time
-headroom is available if a future coherence mechanism reduces KV-related
-latency and control traffic?** It implements no coherence policy, state machine,
-predictor, directory, ownership protocol, or cache hierarchy. The executable
-does not link to the project's original coherence simulator.
+This revision replaces the original flat `40 ns / 32 B` tax on every request.
+It estimates traffic with the existing **baseline** line-directory engine,
+adds finite per-node caches, and times the resulting services with bounded
+compute/memory overlap. Hypothetical reductions apply to KV coherence events;
+no optimized coherence policy or predictor is implemented.
 
 ## Build and run
 
-From the Great Lakes project root:
+From the project root:
 
 ```bash
 cmake -S perf -B build-perf -DCMAKE_BUILD_TYPE=Release
-cmake --build build-perf -j 2
+cmake --build build-perf -j 4
 ctest --test-dir build-perf --output-on-failure
 ./build-perf/architecture_perf
 ./build-perf/architecture_perf --help
 ```
 
-For a scheduled compute-node run, submit from
+On Great Lakes, submit from
 `/gpfs/accounts/eecs570f26s001_class_root/eecs570f26s001_class/nshreyas/project_prof`:
 
 ```bash
 sbatch perf/run_slurm.sh
 ```
 
-Results go under `results/perf/`. The script runs 11 workload/system
-configurations, each with seven overhead assumptions. Build and execution need
-only a C++17 compiler and CMake. `perf/model.cpp` contains the workload and event
-loop; `model.hpp` contains plain data structures; `main.cpp` handles parameters
-and reporting; `tests.cpp` checks independent analytical cases.
+The job builds and tests the model, runs 18 configurations with seven overhead
+assumptions each, and collects a four-core CPU probe. New results are under
+`results/refined_perf/`; earlier `results/perf/` files retain the v1 results.
+The root `PERFORMANCE_RESULTS.md` describes the latest run.
 
-## Workload and timing
+## What changed
 
-The workload has three sequential phases:
+| Earlier simplifying assumption | Revised treatment |
+| --- | --- |
+| Every generated access goes off chip | Logical accesses use a finite, fully associative, per-node LRU cache |
+| Every access has the same coherence tax | Directory lookups, owner downgrades, invalidations, and writebacks are counted separately by access kind |
+| Private writes repeatedly pay a tax | A first write acquires permission; subsequent stores to a resident exclusive line hit locally |
+| A prefix is fetched on every round | Resident clean prefix copies are reused locally; working-set/cache-size sweeps expose capacity misses |
+| Reductions have no fork cost | Candidates pay a fork barrier, a per-prefix-region cost, and explicit resident dirty-prefix writebacks |
+| Compute waits for the full batch | One next-step compute stage can overlap the current batch's tail, with a configurable dependency threshold |
+| No recovery budget | Candidates pay a configurable expected recovery latency/traffic budget per KV permission transaction |
 
-1. A lead accelerator appends a prefix for 32 steps.
-2. At a fork barrier, three child accelerators begin 64 rounds of reading that
-   shared prefix and appending separate leaves. Host metadata work runs at the
-   same time as the children, on a separate stream.
-3. Host completion bookkeeping starts after all children finish.
+## Traffic profiling and cache semantics
 
-Each child step computes for 200 ns, then issues a batch of 32 prefix reads,
-eight leaf writes, and two metadata transactions, with at most eight memory
-requests outstanding per stream. The lead writes eight prefix lines and issues
-two metadata transactions per step. The host computes 50 ns per step and issues
-two metadata transactions. These counts, compute durations, and concurrency are
-configurable. Each accelerator has one stream; the lead uses node 1 before the
-fork, and children use nodes 1..N afterward. The host is node 0.
+`profile.cpp` reuses `RegionStateMachine` from `src/region.cpp`, always in
+`Policy::Baseline`. It never calls dynamic hints or the sharing predictor.
+The baseline engine has explicit single-writer permissions and clean sharers;
+finite LRU capacity is implemented by calling its new `evict()` hook. Dirty
+evictions update backing data before discarding copies. Stores use write allocation.
+Invalidation removes
+stale entries from the affected node's LRU accounting before its next access.
+A clean eviction sends an assumed 8-byte directory notice and costs 4 ns;
+dirty eviction additionally transfers a 64-byte writeback. These small notice
+costs are currently constants in `model.cpp`.
 
-All accesses are modeled **off-chip transactions**, rather than all program
-loads/stores. Their counts are input assumptions representing traffic remaining
-after any cache hits or coalescing. Prefix addresses are common across agents,
-leaf addresses are separate, and metadata addresses are common. Addresses and
-read/write labels describe the workload; the simulator does not infer coherence
-messages, hits, sharers, or dependencies from them. It does not execute KV data
-or implement a functional RadixTree.
+On a read miss, an exclusive remote owner is downgraded, and a dirty owner
+writes back. Later clean readers require directory registration, without another
+owner snoop. A write upgrade/miss invalidates other copies. Local shared reads
+and exclusive writes have no directory lookup. Data hits that still need a
+write-permission upgrade retain their coherence costs. Repeated accesses to the
+same line within an agent wait for the previous access/fill to complete in the
+timing model.
 
-A single shared, FIFO, aggregate interconnect serializes request data plus a
-generic control-traffic budget. The memory service itself is pipelined, with no
-additional memory-controller capacity limit. The default memory latency is
-150 ns and the default link rate is 32 decimal GB/s, equal to 32 bytes/ns.
-Every transaction transfers 64 data bytes and, in the reference case, an assumed
-32 control bytes and 40 ns of additional coherence-related latency.
+The counters are exact for this abstract reference engine and its chosen
+logical trace, **not hardware ground truth or a complete MESI implementation**.
+The profile uses fixed step/access round-robin interleaving across streams.
+Timing changes do not feed back to reorder that cache/directory trace. This
+avoids attributing different work to the candidate, but misses timing-dependent
+replacement and contention effects. Replacement, cache capacity, data versions,
+and dirty ownership are checked functionally in the profiling pass; the timing
+pass is not a full coherence/network simulator.
 
-For a request issued at `t`:
+## Workload
+
+There are lead, parallel-children, and completion phases. The lead uses
+accelerator 1; children use accelerators 1..N, so the first child retains the
+lead's local prefix when it remains resident. The host is node 0.
+
+Defaults:
+
+- Host plus three accelerators; 32 lead steps and 64 child rounds.
+- Each child step: 32 prefix reads, eight leaf stores, two metadata accesses.
+- Each lead step: eight prefix stores and two metadata accesses.
+- Host metadata work runs alongside children, followed by completion bookkeeping.
+- Prefix working set: 64 lines (4 KiB); leaf working set per child: 128 lines
+  (8 KiB); local cache per node: 64 KiB.
+- Four logical stores update each 64-byte KV line before advancing. The lead
+  therefore initializes all 64 prefix lines. Leaf addresses advance and wrap
+  within their configured working set. Metadata addresses are shared.
+- Prefix reads scan across `prefix_lines`, rather than repeatedly naming just
+  the first batch. Logical access count remains 8,520 by default.
+
+Defaults intentionally include a fitting-cache case. No claim is made that all
+KV traffic misses accelerator L2. `--cache-bytes` is an available cache budget,
+not a claim about a particular processor's total L2 size. If a prefix fits and
+isn't displaced, subsequent reads hit; the capacity-streaming experiment uses a
+64 KiB prefix with only 4 KiB cache per node and a longer lead initialization.
+
+## Operation-sensitive cost model
+
+| Parameter | Default assumption |
+| --- | ---: |
+| Local data hit | 2 ns (not two hardware cycles) |
+| Memory data service | 150 ns |
+| Peer-owner data service | 150 ns |
+| Directory lookup | 20 ns + 16 control bytes |
+| Owner downgrade snoop | 20 ns + 16 control bytes |
+| Invalidation per target | 12 ns + 16 control bytes |
+| Dirty writeback | 10 ns additional service + 64 payload bytes |
+| Link bandwidth | 32 decimal GB/s = 32 bytes/ns |
+
+All table costs have CLI overrides. These values are **unmeasured assumptions**.
+There is no single cost per PrefixKV or LeafKV request: the profile's event
+counts determine its cost. The `--kinds` CSV separates metadata, prefix, and leaf
+accesses, hits, fills, directory lookups, snoops, invalidations, writebacks, and
+evictions. Eviction/writeback costs are attributed to the access triggering
+that work, which may differ from the victim line's category.
+
+The seven comparisons retain 100/75/50/25/0% of KV directory/snoop/invalidation
+latency and control bytes, plus separate latency-only and traffic-only cases.
+Metadata event costs, cache residency, data fills, dirty writeback payloads,
+and eviction notices are preserved. Reducing events does not establish protocol
+safety; the fractions remain hypothetical achievable savings.
+
+For an access with profiled traffic:
 
 ```text
-link_start = max(t, link_available)
-link_end = link_start + (64 + control_bytes) / bandwidth_bytes_per_ns
-completion = link_end + memory_latency + coherence_latency + optional_added_latency
+earliest = max(issue time, previous same-node/same-line completion)
+link_end = max(earliest, link_available) + total transferred bytes / bandwidth
+finish = link_end + data-service-or-hit latency
+       + retained directory/snoop/invalidation latency
+       + writeback/eviction cost + candidate check/recovery budget
 ```
 
-Completion opens an outstanding-request slot. A stream starts its next compute
-step after its current batch finishes. Separate agents' compute and memory
-activity overlap; a single agent's compute and memory batch are sequential.
-Phase duration is the last completion across its streams, and phases are joined
-by barriers. Execution time is the actual simulated makespan, **not a sum of
-all agents' memory penalties**. There is no interconnect queueing delay hidden
-inside the user-supplied coherence latency; queueing is modeled explicitly.
+A local access with no network traffic skips the link entirely. Memory service
+is pipelined; there is no separate finite-bandwidth DRAM-controller model.
 
-## Comparisons without a policy
+## Fork, flush, and recovery costs
 
-Every comparison replays exactly the same compute steps, off-chip requests,
-data bytes, agents, and dependencies. Only two assumed KV overhead multipliers
-change. The default sweep retains 100%, 75%, 50%, 25%, and 0% of both overhead
-terms, plus two cases that halve latency alone or control traffic alone.
-Metadata overhead always remains unchanged.
+At the lead-to-children boundary, each candidate pays:
 
-The reference is an **assumed overhead budget**, not an implemented baseline
-coherence protocol. A reduction fraction is a hypothetical input; the simulator
-does not establish that any mechanism can achieve it. The zero-KV-overhead case
-is optimistic headroom under these assumptions when added/setup costs are zero.
-It retains memory latency, all payload traffic, metadata overhead, barriers,
-and compute. No protocol safety or data-consistency conclusion follows from it.
+- `--setup-ns` (default 0) plus `--fork-barrier-ns` (200 ns).
+- `--region-barrier-ns` (40 ns) per touched prefix region (4 KiB by default).
+- A control budget of one directory-sized exchange per endpoint and region.
+- With `--flush-at-fork 1`, all **resident dirty prefix lines** are written back,
+  using the same link and a bounded number of concurrent flushes.
 
-`--added-latency-ns` optionally adds latency to every KV request in the
-counterfactual cases; `--setup-ns` adds a one-time startup cost to them. Both
-default to zero. They let a future mechanism's own costs consume its potential
-benefit, without implementing that mechanism. The reference pays neither.
+The functional profiler cleans those lines at the fork. Consequently they do
+not write back again at the first child read: this moves a required writeback
+rather than counting it twice. The reference may instead serve that dirty data
+on demand. The `fork_overhead` phase makes the critical-path penalty explicit.
+Region transitions for later allocations, permission-table replacement, and
+arbitrary protocol recovery sequences are not implemented.
 
-## Useful metrics
+The default expected recovery rate is 1% of KV accesses needing directory
+permission. Each expected recovery adds 200 ns plus 32 bytes. This is a user
+budget, not a predictor measurement or an assertion about an actual error rate.
+`--added-latency-ns` adds a candidate check cost to every logical KV access,
+including local hits. These knobs support honest break-even studies.
 
-- **Simulated execution time and speedup:** critical-path makespan and its ratio
-  to the reference.
-- **Critical-path time saved:** reference makespan minus scenario makespan,
-  rather than the sum of latency reductions across overlapping requests.
-- **Average queue wait and link utilization:** whether control-traffic reduction
-  relieves the interconnect bottleneck.
-- **Payload/control bytes:** verifies that workload data stays fixed while the
-  assumed control budget changes.
-- **Aggregate worker compute/wait and assumed coherence latency:** attribution
-  across workers; overlapping totals are not additive components of elapsed
-  execution time.
-- **Per-phase timing:** exposes whether lead, parallel agents, or host completion
-  dominates execution.
+## Within-agent overlap
 
-CSV files include all input parameters for reproducibility.
+`--overlap-trigger 0.5` starts the next step's compute after half the current
+batch's accesses finish, assuming that compute is independent of the remaining
+requests. At most one next compute stage is buffered. Its memory batch cannot
+start until the preceding batch finishes, and the outstanding-access window
+remains bounded (`--outstanding 8` by default). The host retains sequential
+compute/batch dependencies.
 
-## Sensitivity experiments and checks
+Trigger 1 disables within-agent overlap; trigger 0 permits eager independent
+next-step compute. This is a dependency assumption to sweep, not a measured
+property of attention kernels. Increasing outstanding requests alone is a
+different experiment. Aggregate compute, memory-wait, and overlap durations
+must not be added as independent components of elapsed time. Execution time is
+the last completion of dependent phases, including candidate fork penalties.
 
-```bash
-# Export the complete default comparison.
-./build-perf/architecture_perf --csv comparison.csv --phases phases.csv
+## CPU measurements and limits
 
-# More compute reduces the relative value of coherence optimization.
-./build-perf/architecture_perf --compute-ns 10000
+`cpu_probe.cpp` is built on Linux x86-64 and needs four allocated CPUs. It pins
+one producer and three consumers to CPUs from the job's affinity mask, and
+reports pinning success, per-reader/per-repetition dependent-walk time, and a
+checksum. A shuffled 64-byte linked cycle limits memory-level parallelism and
+reduces simple streaming prefetch effects. Two working sets (64 KiB and 4 MiB)
+are tested for:
 
-# Constrained bandwidth makes control bytes more expensive.
-./build-perf/architecture_perf --bandwidth-gbps 2
+- `warm`: an unflushed consumer warm-up pass before timing.
+- `cold`: producer flushes all lines with `CLFLUSH` and an ordering fence.
+- `handoff`: producer writes, then consumers walk without flushing.
+- `private`: each consumer updates its own warmed private buffer.
 
-# More outstanding requests hide more fixed latency.
-./build-perf/architecture_perf --outstanding 64
+These are loop-inclusive CPU measurements, not isolated event latencies. An
+unflushed 4 MiB working set may exceed local cache; producer handoff does not
+ensure every timed line stays modified until it is read. Three simultaneous
+readers also interfere. Differences between these cases must not be copied
+into a directory/snoop/CXL/GPU latency knob as if they were a direct calibration.
+A flushed line has already written back dirty data, so flushed reads do not
+measure a dirty-owner handoff.
 
-# With no initial coherence cost, reduction fractions give no speedup.
-./build-perf/architecture_perf --coherence-ns 0 --coherence-bytes 0
+`run_probe.sh` records CPU/cache topology, affinity, kernel PMU restrictions,
+and available `perf` events. It attempts generic counters only when available;
+permission failures are retained without changing kernel settings. Whole-process
+counters include initialization and synchronization. Model-specific offcore
+names must be selected for the actual CPU, following
+[Intel's PMU event documentation](https://perfmon-events.intel.com/).
+[The Intel manuals](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)
+provide cache-maintenance and ordering semantics. CPU measurements are not
+accelerator/CXL measurements and are not automatically imported as parameters.
 
-# Metadata costs are preserved, so this comparison also gives no speedup.
-./build-perf/architecture_perf --prefix-reads 0 --leaf-writes 0
+## Validation and interpretation
 
-# A sufficiently expensive future mechanism can lose performance.
-./build-perf/architecture_perf --added-latency-ns 80
+Twelve focused tests cover analytic serial/parallel timings, finite capacity,
+dirty eviction, private store reuse, first/second reader asymmetry, fork placement
+and no duplicate writebacks, bounded compute overlap, in-flight fill dependencies,
+fitting-prefix reuse, accounting, zero-headroom cases, and candidate regressions.
+The original directory tests also remain available in the complete root build.
 
-# Reproduce all 11 configurations.
-bash perf/run_experiments.sh
-```
-
-The nine focused tests include hand-calculated serial and concurrent timings,
-memory-level parallelism, phase dependencies, unchanged payload and metadata
-costs, zero-benefit cases, compute-only timing, added-cost regressions, and
-validation errors. Configure with `-DENABLE_SANITIZERS=ON` for ASan/UBSan.
-
-All numerical costs and transaction rates are illustrative assumptions. This
-is an execution-time sensitivity study, not a benchmark of Great Lakes, CXL,
-GPU kernels, or an actual coherence implementation. To argue for a particular
-design, first calibrate traffic and costs using measurements, then show that
-the design achieves the assumed reductions within the added-cost budget.
+The old 6.76% and 14.62% figures describe v1 assumptions. They are not promised
+speedups, and are not a formally established upper bound across hardware or all
+workloads. This refinement can produce gains, zero benefit, or losses. Real
+calibration still requires representative logical traces, cache budgets,
+dependency information, and measured event costs on the target architecture.

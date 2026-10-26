@@ -38,5 +38,5 @@ add_test(NAME small_regions COMMAND radix_coherence --region-bytes 128 --leaf-re
 add_test(NAME invalid_accelerators COMMAND radix_coherence --accelerators 0)
 set_tests_properties(invalid_accelerators PROPERTIES WILL_FAIL TRUE)
 
-# Independent, policy-neutral performance sensitivity simulator.
+# Performance frontend using baseline traffic profiles, without an optimized policy.
 add_subdirectory(perf)

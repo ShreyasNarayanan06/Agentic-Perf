@@ -40,6 +40,8 @@ public:
                        Metrics& metrics, Policy policy, std::ostream* log = nullptr);
     AccessResult access(const Request& request);
     void apply_hint(RegionId id, Hint hint, std::uint64_t sequence);
+    bool evict(NodeId node, RegionId id, std::size_t line);
+    void writeback_region(RegionId id);
     const Region& region(RegionId id) const { return regions_.at(id); }
     void check_region(RegionId id) const;
 
