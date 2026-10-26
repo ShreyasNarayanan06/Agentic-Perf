@@ -1,0 +1,28 @@
+cmake_minimum_required(VERSION 3.12)
+project(architecture_perf LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+option(ENABLE_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
+
+# This target has no dependency on the coherence policy simulator.
+add_library(performance_model model.cpp)
+target_include_directories(performance_model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_options(performance_model PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+if(ENABLE_SANITIZERS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(performance_model PUBLIC -fsanitize=address,undefined -fno-omit-frame-pointer)
+    target_link_libraries(performance_model PUBLIC -fsanitize=address,undefined)
+endif()
+
+add_executable(architecture_perf main.cpp)
+target_link_libraries(architecture_perf PRIVATE performance_model)
+target_compile_options(architecture_perf PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+
+enable_testing()
+add_executable(performance_tests tests.cpp)
+target_link_libraries(performance_tests PRIVATE performance_model)
+target_compile_options(performance_tests PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+add_test(NAME policy_neutral_performance_tests COMMAND performance_tests)
+add_test(NAME policy_neutral_cli COMMAND architecture_perf)
+add_test(NAME policy_neutral_invalid_bandwidth COMMAND architecture_perf --bandwidth-gbps 0)
+set_tests_properties(policy_neutral_invalid_bandwidth PROPERTIES WILL_FAIL TRUE)

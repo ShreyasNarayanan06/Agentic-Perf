@@ -1,0 +1,12 @@
+build*/
+results/
+*.o
+*.a
+radix_coherence
+coherence_tests
+
+# Performance executables and generated logs
+architecture_perf
+performance_tests
+*.log
+.DS_Store
