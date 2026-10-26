@@ -1,5 +1,32 @@
 # Dynamic Region-Level Coherence for Multi-Agent Radix Prefix Trees
 
+## Latest performance results
+
+For a **hypothetical 50% reduction in KV coherence-event latency and control
+traffic**, the refined model reports the following simulated execution times.
+Metadata costs stay unchanged; fork barriers, dirty flushes, and expected
+recovery costs are included.
+
+| Configuration | Reference (us) | Reduced KV overhead (us) | Execution-time change |
+| --- | ---: | ---: | --- |
+| 4 KiB prefix fits in 64 KiB local cache | 38.447 | 38.960 | **1.34% slower** |
+| 64 KiB prefix exceeds 4 KiB local cache | 427.808 | 406.436 | **5.00% faster** |
+| Larger-than-cache workload with a 2 GB/s link | 1443.186 | 1309.666 | **9.25% faster** |
+
+The fitting-cache reference performs **838 off-chip transactions from 8,520
+logical accesses**. Local reuse can remove most of the opportunity for coherence
+savings, while transition costs can outweigh the remaining benefit.
+
+These are sensitivity estimates under configurable assumptions. The optimized
+coherence policy is unspecified. CPU microbenchmark and PMU measurements are
+reported separately and do not establish accelerator/CXL event latencies.
+Cluster tests and local AddressSanitizer/UndefinedBehaviorSanitizer checks pass.
+
+See [the complete results and limitations](PERFORMANCE_RESULTS.md) and
+[the refined model design and commands](perf/README.md).
+
+## Model overview
+
 For the newer **finite-cache execution-time sensitivity model**, see
 [perf/README.md](perf/README.md). Build it independently with
 `cmake -S perf -B build-perf`; run `build-perf/architecture_perf`. It uses no
